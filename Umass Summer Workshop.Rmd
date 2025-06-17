@@ -1,0 +1,75 @@
+---
+title: "Umass Summer"
+output: html_document
+date: "2025-06-09"
+---
+```{r}
+## load data
+library(sf)
+library(spdep)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+
+setwd("~/Desktop/UMass Workshop/Project") 
+
+mydat <- st_read("final_df.geojson")
+```
+
+
+```{r}
+fac <- read_excel("Column_Labels.xlsx", sheet = 3)
+```
+
+```{r}
+View(fac)
+```
+
+
+```{r}
+## Removing census tracts with invalid spatial coordinates
+table(st_is_valid(mydat))
+
+analysis.dat <- mydat[st_is_valid(mydat),]
+```
+
+```{r}
+our_data <- analysis.dat %>%
+  select(any_of(fac$Field))
+```
+
+```{r}
+# Replace "NULL" with NA in every character column
+our_data2 <- our_data %>%
+  mutate(across(
+    where(is.character),
+    ~ na_if(., "NULL")
+  ))
+```
+
+```{r}
+# Keep columns that has NA less than 50% 
+na_col <- colMeans(is.na(our_data2)) * 100
+cols_to_drop <- names(na_col[na_col > 50])
+
+clean_data <- our_data2 %>%
+  select(-all_of(cols_to_drop))
+
+cat("Dropped", length(cols_to_drop),
+    "columns with >50% NA. Remaining columns:", ncol(clean_data), "\n")
+```
+
+```{r}
+# Coerce all the columns to numeric
+clean_data <- clean_data %>%
+  mutate(
+    across(
+      .cols = -geometry,
+      .fns  = ~ as.numeric(as.character(.))    
+    )
+  )
+
+summary(clean_data)
+```
+

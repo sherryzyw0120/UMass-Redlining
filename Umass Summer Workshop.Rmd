@@ -18,10 +18,16 @@ output:
 ## Loading library
 
 ```{r}
+# install.packages("e1071")
 library(sf)
 library(spdep)
 library(dplyr)
 library(stringr)
+library(e1071)
+library(class)
+library(randomForest)
+library(caret)
+library(MLmetrics)
 ```
 
 ## Loading the dataset
@@ -135,7 +141,83 @@ newdata <- newdata %>%
     -all_of(b_cols),
     -all_of(t_cols)
   )         
-         
+```
+
+# Delete all rows with at least one NA
+
+```{r}
+newdata <- newdata %>%
+  filter(rowSums(is.na(.)) == 0)
+
 glimpse(newdata)
+```
+
+# Dropping geometry variable & changing the class1 variable to factor
+
+```{r}
+newdata <- st_drop_geometry(newdata)
+newdata <- newdata %>%
+  mutate(class1 = as.factor(class1))
+```
+
+# Splitting of training and testing
+
+```{r}
+set.seed(1234)
+n <- nrow(newdata)
+train_idx <- sample(n, size = 0.8 * n)
+
+train <- newdata[train_idx, ]
+test <- newdata[-train_idx, ]
+
+train <- train %>%
+  select(-formatGeoID, -geoid.x, -cbsa_name)
+
+test <- test %>%
+  select(-formatGeoID, -geoid.x, -cbsa_name)
+```
+
+# Running SVM Model with data
+
+```{r}
+model.svm <- svm(class1 ~ ., data = train, probability=TRUE)
+pred_svm <- predict(model.svm, test)
+```
+
+# Running KNN Model with data
+
+```{r}
+train_x <- train[, setdiff(names(train), "class1")]
+train_y <- train$class1
+
+test_x <- test[, setdiff(names(test), "class1")]
+test_y <- test$class1
+```
+
+```{r}
+pred_knn <- knn(train = train_x, test = test_x, cl = train_y, k = 5)
+```
+
+# Running Random Forest Model with data
+
+```{r}
+model.rf <- randomForest(class1 ~ ., data = train)
+pred_rf <- predict(model.rf, test)
+```
+
+# Getting the assessment metrics: overall accuracy, F1-score, Log-loss, Brier Score, and Sensitivity/Specificity for all models above
+
+```{r}
+# Accuracy
+acc_svm <- mean(pred_svm == test$class1)
+acc_knn <- mean(pred_knn == test_y)
+acc_rf  <- mean(pred_rf  == test$class1)
+
+# Table of metrics
+results <- data.frame(
+  model    = c("SVM", "KNN", "RF"),
+  accuracy = c(acc_svm, acc_knn, acc_rf)
+)
+results
 ```
 

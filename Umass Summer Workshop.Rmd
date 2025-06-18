@@ -1,75 +1,141 @@
 ---
-title: "Umass Summer"
-output: html_document
-date: "2025-06-09"
+title: "SWIB24: Redlining"
+date: "Redlining, Health and the Environment"
+
+fontsize: 11pt
+geometry: margin=1in
+
+output:
+  pdf_document:
+    includes:
+      in_header: header.tex
+    fig_width: 5
+    fig_height: 3.5
 ---
+
+# Data Preparation
+
+## Loading library
+
 ```{r}
-## load data
 library(sf)
 library(spdep)
-library(tidyr)
 library(dplyr)
-library(ggplot2)
-library(readxl)
+library(stringr)
+```
 
-setwd("~/Desktop/UMass Workshop/Project") 
+## Loading the dataset
 
+```{r}
 mydat <- st_read("final_df.geojson")
+dim(mydat)
 ```
 
-
-```{r}
-fac <- read_excel("Column_Labels.xlsx", sheet = 3)
-```
-
-```{r}
-View(fac)
-```
-
-
-```{r}
 ## Removing census tracts with invalid spatial coordinates
-table(st_is_valid(mydat))
 
+```{r}
+table(st_is_valid(mydat))
 analysis.dat <- mydat[st_is_valid(mydat),]
 ```
 
-```{r}
-our_data <- analysis.dat %>%
-  select(any_of(fac$Field))
-```
+# Viewing the dataset
 
 ```{r}
+View(analysis.dat)
+```
+
+# Collecting the column names
+
+```{r}
+ournames <- names(analysis.dat)[c(1:35,37,63:76,77:202,206,207, 226:228, 347:358, 376:379, 384:387, 392:395)]
+
+newdata <- analysis.dat %>%
+  select(all_of(ournames))
+
+dim(newdata)
+```
+
+# See the var types
+
+```{r}
+glimpse(newdata)
+```
+
 # Replace "NULL" with NA in every character column
-our_data2 <- our_data %>%
+
+```{r}
+newdata <- newdata %>%
   mutate(across(
     where(is.character),
     ~ na_if(., "NULL")
   ))
 ```
 
-```{r}
 # Keep columns that has NA less than 50% 
-na_col <- colMeans(is.na(our_data2)) * 100
+
+```{r}
+na_col <- colMeans(is.na(newdata)) * 100
 cols_to_drop <- names(na_col[na_col > 50])
 
-clean_data <- our_data2 %>%
+newdata <- newdata %>%
   select(-all_of(cols_to_drop))
-
-cat("Dropped", length(cols_to_drop),
-    "columns with >50% NA. Remaining columns:", ncol(clean_data), "\n")
 ```
 
+# Changing the Median Family Income to numerical
+
 ```{r}
-# Coerce all the columns to numeric
-clean_data <- clean_data %>%
+newdata <- newdata %>%
   mutate(
     across(
-      .cols = -geometry,
+      .cols = MedianFamilyIncome,
       .fns  = ~ as.numeric(as.character(.))    
     )
   )
+```
 
-summary(clean_data)
+# Extracting the first 2 characters of the string, and changing the data from character to numeric of the column starts with "P_"
+
+```{r}
+newdata <- newdata %>%
+  mutate(
+    across(
+      starts_with("T_"),        
+      ~ as.double(str_sub(.x, 1, 2))
+    )
+  )
+```
+
+# Averaging the columns of D_, P_, ... etc
+
+```{r}
+# Getting the column names
+non_cols <- c("MINORPCT", "LOWINCPCT", "UNEMPPCT", "LINGISOPCT", "LESSHSPCT", "UNDER5PCT", "OVER64PCT", "PM25", "OZONE", "DSLPM", "CANCER", "RESP", "PTRAF", "PNPL",  "PRMP",  "PTSDF",  "UST",  "PWDIS")
+d_cols <- c("D_PM25_2", "D_OZONE_2", "D_DSLPM_2", "D_CANCR_2", "D_RESP_2", "D_PTRAF_2", "D_PNPL_2",  "D_PRMP_2",  "D_PTSDF_2",  "D_UST_2",  "D_PWDIS_2", "D_LDPNT_2")
+p_cols <- c("P_VULEOPCT", "P_MINORPCT", "P_LWINCPCT", "P_UNEMPPCT", "P_LNGISPCT", "P_LESHSPCT", "P_UNDR5PCT", "P_OVR64PCT", "P_PM25", "P_OZONE", "P_DSLPM", "P_CANCR", "P_RESP", "P_PTRAF", "P_LDPNT", "P_PNPL", "P_PRMP", "P_PTSDF", "P_UST", "P_PWDIS", "P_PM25_D2", "P_OZONE_D2", "P_DSLPM_D2", "P_CANCR_D2", "P_RESP_D2", "P_PTRAF_D2", "P_LDPNT_D2", "P_PNPL_D2", "P_PRMP_D2", "P_PTSDF_D2", "P_UST_D2",   "P_PWDIS_D2")
+b_cols <- c("B_VULEOPCT", "B_MINORPCT", "B_LWINCPCT", "B_UNEMPPCT", "B_LNGISPCT", "B_LESHSPCT", "B_UNDR5PCT", "B_OVR64PCT", "B_PM25", "B_OZONE", "B_DSLPM", "B_CANCR", "B_RESP", "B_PTRAF", "B_LDPNT", "B_PNPL", "B_PRMP", "B_PTSDF", "B_UST", "B_PWDIS", "B_PM25_D2", "B_OZONE_D2", "B_DSLPM_D2", "B_CANCR_D2", "B_RESP_D2", "B_PTRAF_D2", "B_LDPNT_D2", "B_PNPL_D2", "B_PRMP_D2", "B_PTSDF_D2", "B_UST_D2",   "B_PWDIS_D2")
+t_cols <- c("T_VULEOPCT", "T_MINORPCT", "T_LWINCPCT", "T_UNEMPPCT", "T_LNGISPCT", "T_LESHSPCT", "T_UNDR5PCT", "T_OVR64PCT", "T_PM25", "T_OZONE", "T_DSLPM", "T_CANCR", "T_RESP", "T_PTRAF", "T_LDPNT", "T_PNPL", "T_PRMP", "T_PTSDF", "T_UST", "T_PWDIS", "T_PM25_D2", "T_OZONE_D2", "T_DSLPM_D2", "T_CANCR_D2", "T_RESP_D2", "T_PTRAF_D2", "T_LDPNT_D2", "T_PNPL_D2", "T_PRMP_D2", "T_PTSDF_D2", "T_UST_D2",   "T_PWDIS_D2")
+```
+
+
+```{r}
+newdata <- newdata %>%
+  mutate(
+    non_Pollution = rowMeans(across(all_of(non_cols))),
+    d_Pollution   = rowMeans(across(all_of(d_cols))),
+    p_Pollution   = rowMeans(across(all_of(p_cols))),
+    b_Pollution   = rowMeans(across(all_of(b_cols))),
+    t_Pollution   = rowMeans(across(all_of(t_cols)))
+  )
+
+newdata <- newdata %>%
+  select(
+    -all_of(non_cols),
+    -all_of(d_cols),
+    -all_of(p_cols),
+    -all_of(b_cols),
+    -all_of(t_cols)
+  )         
+         
+glimpse(newdata)
 ```
 

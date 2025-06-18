@@ -18,7 +18,6 @@ output:
 ## Loading library
 
 ```{r}
-# install.packages("e1071")
 library(sf)
 library(spdep)
 library(dplyr)
@@ -28,11 +27,15 @@ library(class)
 library(randomForest)
 library(caret)
 library(MLmetrics)
+library(Metrics)
+library(patchwork)
 ```
 
 ## Loading the dataset
 
 ```{r}
+setwd("~/Desktop/UMass Workshop/Project") 
+
 mydat <- st_read("final_df.geojson")
 dim(mydat)
 ```
@@ -160,6 +163,19 @@ newdata <- newdata %>%
   mutate(class1 = as.factor(class1))
 ```
 
+```{r}
+keep_areas <- c(
+  "Los Angeles-Long Beach, CA",
+  "Boston-Cambridge-Newton, MA-NH",
+  "New York-Newark-Jersey City, N"
+)
+
+newdata <- newdata %>%
+  filter(cbsa_name %in% keep_areas)
+
+table(newdata$cbsa_name)
+```
+
 # Splitting of training and testing
 
 ```{r}
@@ -219,5 +235,216 @@ results <- data.frame(
   accuracy = c(acc_svm, acc_knn, acc_rf)
 )
 results
+```
+
+```{r}
+# Obtain class‐probabilities for each model
+
+# SVM 
+prob_svm <- attr(
+  predict(model.svm, test, probability = TRUE),
+  "probabilities"
+)
+
+# Random forest
+prob_rf <- predict(model.rf, test, type = "prob")
+
+# KNN
+knn3_mod <- knn3(class1 ~ ., data = train, k = 5)
+prob_knn <- predict(knn3_mod, test)
+```
+
+```{r}
+# Generate class predictions
+
+# SVM & RF
+pred_svm <- predict(model.svm, test)
+pred_rf  <- predict(model.rf,  test)
+
+# KNN: pick the class with highest probability
+pred_knn <- factor(
+  colnames(prob_knn)[apply(prob_knn, 1, which.max)],
+  levels = levels(test$class1)
+)
+```
+
+```{r}
+# Confusion‐matrix metrics
+cm_svm <- confusionMatrix(pred_svm, test$class1)
+cm_rf  <- confusionMatrix(pred_rf,  test$class1)
+cm_knn <- confusionMatrix(pred_knn, test$class1)
+
+macro_avg <- function(cm, metric) {
+  mean(cm$byClass[, metric], na.rm = TRUE)
+}
+
+metrics_df <- data.frame(
+  Model       = c("SVM", "RF", "KNN"),
+  Accuracy    = c(
+    cm_svm$overall["Accuracy"],
+    cm_rf$overall["Accuracy"],
+    cm_knn$overall["Accuracy"]
+  ),
+  Sensitivity = c(
+    macro_avg(cm_svm, "Sensitivity"),
+    macro_avg(cm_rf,  "Sensitivity"),
+    macro_avg(cm_knn, "Sensitivity")
+  ),
+  Specificity = c(
+    macro_avg(cm_svm, "Specificity"),
+    macro_avg(cm_rf,  "Specificity"),
+    macro_avg(cm_knn, "Specificity")
+  ),
+  F1          = c(
+    macro_avg(cm_svm, "F1"),
+    macro_avg(cm_rf,  "F1"),
+    macro_avg(cm_knn, "F1")
+  )
+)
+
+print(metrics_df)
+```
+
+
+```{r}
+# Define the manual multiclass Brier‐score function
+brier_multiclass <- function(probs, truth) {
+  y_mat <- model.matrix(~ truth + 0)
+  colnames(y_mat) <- sub("^truth", "", colnames(y_mat))
+  y_mat <- y_mat[, colnames(probs), drop = FALSE]
+  mean(rowSums((probs - y_mat)^2))
+}
+
+# Compute Log‐loss for each model
+LL_svm <- MultiLogLoss(y_pred = prob_svm, y_true = test$class1)
+LL_rf  <- MultiLogLoss(y_pred = prob_rf,  y_true = test$class1)
+LL_knn <- MultiLogLoss(y_pred = prob_knn, y_true = test$class1)
+
+# Compute Brier Score for each model
+BS_svm <- brier_multiclass(probs = prob_svm, truth = test$class1)
+BS_rf  <- brier_multiclass(probs = prob_rf,  truth = test$class1)
+BS_knn <- brier_multiclass(probs = prob_knn, truth = test$class1)
+
+# Append to metrics_df 
+metrics_df <- metrics_df %>%
+  mutate(
+    LogLoss    = c(LL_svm, LL_rf, LL_knn),
+    BrierScore = c(BS_svm, BS_rf, BS_knn)
+  )
+
+print(metrics_df)
+```
+
+```{r}
+predictions_df <- tibble(
+  actual = test$class1,
+  SVM    = pred_svm,
+  RF     = pred_rf,
+  KNN    = pred_knn
+) %>%
+  mutate(geoid.x = newdata$geoid.x[-train_idx])
+
+head(predictions_df)
+```
+
+```{r}
+# 1) Pull only the ID + geometry from your sf (analysis.dat):
+geom_df <- analysis.dat[-train_idx, ] %>%
+  select(geoid.x, lat, lon, cbsa_name)    # keep the real geometry list-column
+
+
+la_indicator <- geom_df$cbsa_name == "Los Angeles-Long Beach, CA"
+la_rows <- c(1:nrow(geom_df))[la_indicator]
+# final_indicator <- intersect(la_rows, setdiff(1:nrow(newdata), train_idx))
+
+# 2) Join onto your predictions and pivot long:
+pred_sf <- geom_df[la_rows,] %>%
+  select(-cbsa_name) %>%
+  right_join(predictions_df[la_rows,], by = "geoid.x") %>%
+  pivot_longer(
+    cols      = actual:KNN,
+    names_to  = "model",
+    values_to = "grade"
+  )
+
+# 3) Now pred_sf is still an sf (with geometry)! Plot facet-grid:
+ggplot(pred_sf) +
+  geom_sf(aes(fill = grade)) +
+  scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
+  facet_grid(~model) +
+  labs(title = "Actual vs. Predicted HOLC Grades") +
+  theme_void() +
+  theme(
+    strip.text      = element_text(size = 12),
+    plot.title      = element_text(hjust = 0.5, size = 16),
+    legend.position = "bottom"
+  )
+```
+
+
+```{r}
+# 1) Pull only the ID + geometry from your sf (analysis.dat):
+geom_df <- analysis.dat[-train_idx, ] %>%
+  select(geoid.x, lat, lon)    # keep the real geometry list-column
+
+
+
+# 2) Join onto your predictions and pivot long:
+pred_sf <- geom_df %>%
+  right_join(predictions_df, by = "geoid.x") %>%
+  pivot_longer(
+    cols      = actual:KNN,
+    names_to  = "model",
+    values_to = "grade"
+  )
+
+# 3) Now pred_sf is still an sf (with geometry)! Plot facet-grid:
+ggplot(pred_sf) +
+  geom_sf(aes(fill = grade)) +
+  scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
+  facet_grid(~model) +
+  labs(title = "Actual vs. Predicted HOLC Grades") +
+  theme_void() +
+  theme(
+    strip.text      = element_text(size = 12),
+    plot.title      = element_text(hjust = 0.5, size = 16),
+    legend.position = "bottom"
+  )
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(sf)
+library(viridis)
+
+# 1) Pull only the ID + geometry from your sf (analysis.dat):
+geom_df <- analysis.dat[-train_idx, ] %>%
+  select(geoid.x, geometry)    # keep the real geometry list-column
+
+# 2) Join onto your predictions and pivot long:
+pred_sf <- geom_df %>%
+  right_join(predictions_df, by = "geoid.x") %>%
+  pivot_longer(
+    cols      = actual:KNN,
+    names_to  = "model",
+    values_to = "grade")
+  # ) %>%
+  # mutate(grade = case_when(grade == "A" ~ 1, grade == "B" ~ 2,
+  #                          grade == "C" ~ 3, grade == "D" ~ 4,))
+
+# 3) Now pred_sf is still an sf (with geometry)! Plot facet-grid:
+ggplot(pred_sf) +
+  geom_sf(aes(fill = grade)) +
+  scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
+  facet_grid(~model) +
+  labs(title = "Actual vs. Predicted HOLC Grades") +
+  theme_void() +
+  theme(
+    strip.text      = element_text(size = 12),
+    plot.title      = element_text(hjust = 0.5, size = 16),
+    legend.position = "bottom"
+  )
 ```
 

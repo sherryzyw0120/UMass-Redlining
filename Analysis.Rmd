@@ -21,21 +21,22 @@ output:
 library(sf)
 library(spdep)
 library(dplyr)
+library(tidyr)
 library(stringr)
+library(tidyverse)
 library(e1071)
 library(class)
 library(randomForest)
 library(caret)
 library(MLmetrics)
-library(Metrics)
-library(patchwork)
+library(ggplot2)
+library(viridis)
+library(pROC)
 ```
 
 ## Loading the dataset
 
 ```{r}
-setwd("~/Desktop/UMass Workshop/Project") 
-
 mydat <- st_read("final_df.geojson")
 dim(mydat)
 ```
@@ -47,12 +48,6 @@ table(st_is_valid(mydat))
 analysis.dat <- mydat[st_is_valid(mydat),]
 ```
 
-# Viewing the dataset
-
-```{r}
-View(analysis.dat)
-```
-
 # Collecting the column names
 
 ```{r}
@@ -62,12 +57,6 @@ newdata <- analysis.dat %>%
   select(all_of(ournames))
 
 dim(newdata)
-```
-
-# See the var types
-
-```{r}
-glimpse(newdata)
 ```
 
 # Replace "NULL" with NA in every character column
@@ -151,8 +140,6 @@ newdata <- newdata %>%
 ```{r}
 newdata <- newdata %>%
   filter(rowSums(is.na(.)) == 0)
-
-glimpse(newdata)
 ```
 
 # Dropping geometry variable & changing the class1 variable to factor
@@ -162,6 +149,8 @@ newdata <- st_drop_geometry(newdata)
 newdata <- newdata %>%
   mutate(class1 = as.factor(class1))
 ```
+
+# Filtering out only 3 targeted cities for analysis
 
 ```{r}
 keep_areas <- c(
@@ -180,199 +169,395 @@ table(newdata$cbsa_name)
 
 ```{r}
 set.seed(1234)
-n <- nrow(newdata)
-train_idx <- sample(n, size = 0.8 * n)
 
-train <- newdata[train_idx, ]
-test <- newdata[-train_idx, ]
+# Add row-id for remerging purpose
+newdata <- newdata %>%
+  mutate(row_id = row_number())
 
+# Separate into train and test set
+train <- newdata %>%
+  filter(cbsa_name == "New York-Newark-Jersey City, N")
+
+test <- newdata %>%
+  filter(cbsa_name %in% c(
+    "Los Angeles-Long Beach, CA",
+    "Boston-Cambridge-Newton, MA-NH"
+  ))
+
+# Train and test metadata
+train_meta <- train %>% select(row_id, formatGeoID, geoid.x, cbsa_name, cartodb_id, objectid, cbsa10, lat, lon)
+test_meta  <- test  %>% select(row_id, formatGeoID, geoid.x, cbsa_name, cartodb_id, objectid, cbsa10, lat, lon)
+
+# Delete the columns for training purpose
 train <- train %>%
-  select(-formatGeoID, -geoid.x, -cbsa_name)
+  select(-formatGeoID, -geoid.x, -cbsa_name, -cartodb_id, -objectid, -cbsa10, -lat, -lon)
 
 test <- test %>%
-  select(-formatGeoID, -geoid.x, -cbsa_name)
+  select(-formatGeoID, -geoid.x, -cbsa_name, -cartodb_id, -objectid, -cbsa10, -lat, -lon)
 ```
 
-# Running SVM Model with data
+# Grid search cross validation
+
+## Divide into folds
 
 ```{r}
-model.svm <- svm(class1 ~ ., data = train, probability=TRUE)
-pred_svm <- predict(model.svm, test)
+k <- 5
+folds <- sample(rep(1:k, length.out = nrow(train)))
 ```
 
-# Running KNN Model with data
+## Accuracy storage
 
 ```{r}
-train_x <- train[, setdiff(names(train), "class1")]
-train_y <- train$class1
-
-test_x <- test[, setdiff(names(test), "class1")]
-test_y <- test$class1
-```
-
-```{r}
-pred_knn <- knn(train = train_x, test = test_x, cl = train_y, k = 5)
-```
-
-# Running Random Forest Model with data
-
-```{r}
-model.rf <- randomForest(class1 ~ ., data = train)
-pred_rf <- predict(model.rf, test)
-```
-
-# Getting the assessment metrics: overall accuracy, F1-score, Log-loss, Brier Score, and Sensitivity/Specificity for all models above
-
-```{r}
-# Accuracy
-acc_svm <- mean(pred_svm == test$class1)
-acc_knn <- mean(pred_knn == test_y)
-acc_rf  <- mean(pred_rf  == test$class1)
-
-# Table of metrics
-results <- data.frame(
-  model    = c("SVM", "KNN", "RF"),
-  accuracy = c(acc_svm, acc_knn, acc_rf)
-)
-results
-```
-
-```{r}
-# Obtain class‐probabilities for each model
-
-# SVM 
-prob_svm <- attr(
-  predict(model.svm, test, probability = TRUE),
-  "probabilities"
+folds_acc_svm <- data.frame(
+  fold = integer(),
+  cost = numeric(),
+  gamma = numeric(),
+  acc = numeric()
 )
 
-# Random forest
-prob_rf <- predict(model.rf, test, type = "prob")
+folds_acc_knn <- data.frame(
+  fold = integer(),
+  k = numeric(),
+  l = numeric(),
+  acc = numeric()
+)
 
-# KNN
-knn3_mod <- knn3(class1 ~ ., data = train, k = 5)
-prob_knn <- predict(knn3_mod, test)
-```
-
-```{r}
-# Generate class predictions
-
-# SVM & RF
-pred_svm <- predict(model.svm, test)
-pred_rf  <- predict(model.rf,  test)
-
-# KNN: pick the class with highest probability
-pred_knn <- factor(
-  colnames(prob_knn)[apply(prob_knn, 1, which.max)],
-  levels = levels(test$class1)
+folds_acc_rf <- data.frame(
+  fold = integer(),
+  mtry = numeric(),
+  ntree = numeric(),
+  acc = numeric()
 )
 ```
 
-```{r}
-# Confusion‐matrix metrics
-cm_svm <- confusionMatrix(pred_svm, test$class1)
-cm_rf  <- confusionMatrix(pred_rf,  test$class1)
-cm_knn <- confusionMatrix(pred_knn, test$class1)
+## Parameters for models
 
-macro_avg <- function(cm, metric) {
-  mean(cm$byClass[, metric], na.rm = TRUE)
+```{r}
+# Parameters for SVM
+grid.svm <- expand.grid(
+  cost  = c(0.1, 1, 10),
+  gamma = c(1e-3, 1e-2, 1e-1)
+)
+
+# Parameters for KNN
+grid.knn <- expand.grid(
+  k = seq(3, 15, by = 2),
+  l = c(0, 1, 2)
+)
+
+# Parameters for RF
+grid.rf <- expand.grid(
+  mtry  = c(sqrt(ncol(train) - 1), (ncol(train) - 1)/3, (ncol(train) - 1)/2), # Number of predictors
+  ntree = c(100, 500, 1000)
+)
+```
+
+## Cross-validation process + Grid-search for SVM
+
+```{r}
+for (i in seq_len(k)) {
+  train_cv_idx <- which(folds != i)
+  val_cv_idx   <- which(folds == i)
+  
+  train_cv <- train[train_cv_idx, ]
+  val_cv   <- train[val_cv_idx,   ]
+  
+  # Grid search SVM
+  for (j in seq_len(nrow(grid.svm))) {
+    C <- grid.svm$cost[j]
+    G <- grid.svm$gamma[j]
+    
+    model.svm <- svm(class1 ~ ., data = train_cv, cost = C, gamma = G)
+    pred_svm <- predict(model.svm, val_cv)
+    
+    folds_acc_svm <- rbind(folds_acc_svm, data.frame(
+      fold = i,
+      cost = C,
+      gamma = G,
+      acc = mean(pred_svm == val_cv$class1)
+    ))
+  }
 }
+```
 
-metrics_df <- data.frame(
-  Model       = c("SVM", "RF", "KNN"),
-  Accuracy    = c(
-    cm_svm$overall["Accuracy"],
-    cm_rf$overall["Accuracy"],
-    cm_knn$overall["Accuracy"]
-  ),
-  Sensitivity = c(
-    macro_avg(cm_svm, "Sensitivity"),
-    macro_avg(cm_rf,  "Sensitivity"),
-    macro_avg(cm_knn, "Sensitivity")
-  ),
-  Specificity = c(
-    macro_avg(cm_svm, "Specificity"),
-    macro_avg(cm_rf,  "Specificity"),
-    macro_avg(cm_knn, "Specificity")
-  ),
-  F1          = c(
-    macro_avg(cm_svm, "F1"),
-    macro_avg(cm_rf,  "F1"),
-    macro_avg(cm_knn, "F1")
+## Cross-validation process + Grid-search for KNN
+
+```{r}
+for (i in seq_len(k)) {
+  train_cv_idx <- which(folds != i)
+  val_cv_idx   <- which(folds == i)
+  
+  train_cv <- train[train_cv_idx, ]
+  val_cv   <- train[val_cv_idx,   ]
+  
+  # Grid search KNN
+  for (j in seq_len(nrow(grid.knn))) {
+    k_cv <- grid.knn$k[j]
+    l_cv <- grid.knn$l[j]
+    
+    model.knn <- knn3(class1 ~ ., data = train_cv, k = k_cv, l = l_cv)
+    pred_knn <- predict(model.knn, val_cv)
+    
+    folds_acc_knn <- rbind(folds_acc_knn, data.frame(
+      fold = i,
+      k = k_cv,
+      l = l_cv,
+      acc = mean(pred_knn == val_cv$class1)
+    ))
+  }
+}
+```
+
+## Cross-validation process + Grid-search for RF
+
+```{r}
+for (i in seq_len(k)) {
+  train_cv_idx <- which(folds != i)
+  val_cv_idx   <- which(folds == i)
+  
+  train_cv <- train[train_cv_idx, ]
+  val_cv   <- train[val_cv_idx,   ]
+  
+  # Grid search RF
+  for (j in seq_len(nrow(grid.rf))) {
+    mtry_cv <- grid.rf$mtry[j]
+    ntree_cv <- grid.rf$ntree[j]
+    
+    model.rf <- randomForest(class1 ~ ., data=train_cv, ntree=ntree_cv, mtry=mtry_cv)
+    pred_rf <- predict(model.rf, val_cv)
+    
+    folds_acc_rf <- rbind(folds_acc_rf, data.frame(
+      fold = i,
+      mtry = mtry_cv,
+      ntree = ntree_cv,
+      acc = mean(pred_rf == val_cv$class1)
+    ))
+  }
+}
+```
+
+## Printing out the results of the folds
+
+```{r}
+folds_acc_svm
+folds_acc_knn
+folds_acc_rf
+```
+
+## Getting the best parameters for SVM
+
+```{r}
+folds_acc_svm_sorted <- folds_acc_svm %>%
+  group_by(cost, gamma) %>%
+  summarise(acc_avg = mean(acc, na.rm=T)) %>%
+  arrange(desc(acc_avg))
+
+best_svm <- folds_acc_svm_sorted[1, ]
+best_cost_svm <- best_svm$cost
+best_gamma_svm <- best_svm$gamma
+best_acc_svm_val <- best_svm$acc_avg
+
+best_cost_svm
+best_gamma_svm
+best_acc_svm_val
+```
+
+## Getting the best parameters for KNN
+
+```{r}
+folds_acc_knn_sorted <- folds_acc_knn %>%
+  group_by(k, l) %>%
+  summarise(acc_avg = mean(acc, na.rm=T)) %>%
+  arrange(desc(acc_avg))
+
+best_knn <- folds_acc_knn_sorted[1, ]
+best_k_knn <- best_knn$k
+best_l_knn <- best_knn$l
+best_acc_knn_val <- best_knn$acc_avg
+
+best_k_knn
+best_l_knn
+best_acc_knn_val
+```
+
+## Getting the best parameters for RF
+
+```{r}
+folds_acc_rf_sorted <- folds_acc_rf %>%
+  group_by(mtry, ntree) %>%
+  summarise(acc_avg = mean(acc, na.rm=T)) %>%
+  arrange(desc(acc_avg))
+
+best_rf <- folds_acc_rf_sorted[1, ]
+best_mtry_rf <- best_rf$mtry
+best_ntree_rf <- best_rf$ntree
+best_acc_rf_val <- best_rf$acc_avg
+
+best_mtry_rf
+best_ntree_rf
+best_acc_rf_val
+```
+
+# Computing all of the metrics for the performance of the 3 models - building the function
+
+```{r}
+compute_metrics <- function(train, test_slice) {
+  # Retraining all 3 models
+  model.svm_test_best <- svm(class1 ~ ., data = train, cost = best_cost_svm, gamma = best_gamma_svm, probability=T)
+  model.knn_test_best <- knn3(class1 ~ ., data = train, k = best_k_knn, l = best_l_knn, prob=T)
+  model.rf_test_best <- randomForest(class1 ~ ., data = train, mtry=best_mtry_rf, ntree=best_ntree_rf)
+
+  # Obtain class probabilities for each model
+  prob_svm <- attr(predict(model.svm_test_best, test_slice, probability = TRUE), "probabilities")
+  prob_knn <- predict(model.knn_test_best, test_slice, type = "prob")
+  prob_rf <- predict(model.rf_test_best, test_slice, type = "prob")
+  
+  # Obtain class predictions for each model
+  pred_svm_test_best <- predict(model.svm_test_best, test_slice)
+  pred_knn_test_best <- factor(
+    colnames(prob_knn)[apply(prob_knn, 1, which.max)],
+    levels = levels(test_slice$class1)
   )
-)
-
-print(metrics_df)
+  pred_rf_test_best <- predict(model.rf_test_best, test_slice)
+  
+  # Confusion‐matrix metrics
+  cm_svm <- confusionMatrix(pred_svm_test_best, test_slice$class1)
+  cm_knn <- confusionMatrix(pred_knn_test_best, test_slice$class1)
+  cm_rf  <- confusionMatrix(pred_rf_test_best, test_slice$class1)
+  
+  # Multiclass log‐loss
+  LL <- c(
+    MultiLogLoss(prob_svm, test_slice$class1),
+    MultiLogLoss(prob_rf,  test_slice$class1),
+    MultiLogLoss(prob_knn, test_slice$class1)
+  )
+  
+  # Multiclass brier
+  brier <- function(probs, truth) {
+    m <- model.matrix(~ truth + 0); colnames(m) <- sub("^truth", "", colnames(m))
+    m <- m[, colnames(probs), drop=FALSE]
+    mean(rowSums((probs - m)^2))
+  }
+  BS <- c(brier(prob_svm, test_slice$class1), brier(prob_rf, test_slice$class1), brier(prob_knn, test_slice$class1))
+  
+  # Assemble
+  df <- data.frame(
+    Model       = c("SVM","RF","KNN"),
+    Accuracy    = c(cm_svm$overall["Accuracy"],
+                    cm_rf$overall["Accuracy"],
+                    cm_knn$overall["Accuracy"]),
+    Sensitivity = c(mean(cm_svm$byClass[,"Sensitivity"]),
+                    mean(cm_rf$byClass[,"Sensitivity"]),
+                    mean(cm_knn$byClass[,"Sensitivity"])),
+    Specificity = c(mean(cm_svm$byClass[,"Specificity"]),
+                    mean(cm_rf$byClass[,"Specificity"]),
+                    mean(cm_knn$byClass[,"Specificity"])),
+    F1          = c(mean(cm_svm$byClass[,"F1"]),
+                    mean(cm_rf$byClass[,"F1"]),
+                    mean(cm_knn$byClass[,"F1"])),
+    LogLoss     = LL,
+    BrierScore  = BS
+  )
+  
+  # Return dataframe
+  return(df)
+}
 ```
 
+# Using the function above to compute the metrics
 
 ```{r}
-# Define the manual multiclass Brier‐score function
-brier_multiclass <- function(probs, truth) {
-  y_mat <- model.matrix(~ truth + 0)
-  colnames(y_mat) <- sub("^truth", "", colnames(y_mat))
-  y_mat <- y_mat[, colnames(probs), drop = FALSE]
-  mean(rowSums((probs - y_mat)^2))
-}
+test_areas <- c("Boston-Cambridge-Newton, MA-NH", "Los Angeles-Long Beach, CA")
 
-# Compute Log‐loss for each model
-LL_svm <- MultiLogLoss(y_pred = prob_svm, y_true = test$class1)
-LL_rf  <- MultiLogLoss(y_pred = prob_rf,  y_true = test$class1)
-LL_knn <- MultiLogLoss(y_pred = prob_knn, y_true = test$class1)
+test_compute_metrics <- test
 
-# Compute Brier Score for each model
-BS_svm <- brier_multiclass(probs = prob_svm, truth = test$class1)
-BS_rf  <- brier_multiclass(probs = prob_rf,  truth = test$class1)
-BS_knn <- brier_multiclass(probs = prob_knn, truth = test$class1)
+res <- lapply(test_areas, function(area) {
+  # Join the meta and Filter the cities and delete the columns
+  test_slice <- test %>% 
+    left_join(test_meta, by = "row_id") %>%
+    filter(cbsa_name == area) %>%
+    select(-formatGeoID, -geoid.x, -cbsa_name, -cartodb_id, -objectid, -cbsa10, -lat, -lon)
+  
+  # Compute the metrics
+  res <- compute_metrics(train, test_slice)
+  
+  # Bind the columns
+  bind_cols(test_areas = area, res)
+}) %>% bind_rows()
 
-# Append to metrics_df 
-metrics_df <- metrics_df %>%
+print(res)
+```
+
+# ROC-AUC curve
+
+```{r}
+cls <- "A"
+
+# Compute ROC objects
+roc_list <- list(
+  SVM = roc(response = test$class1 == cls, predictor = prob_svm[,cls]),
+  RF  = roc(response = test$class1 == cls, predictor = prob_rf[,cls]),
+  KNN = roc(response = test$class1 == cls, predictor = prob_knn[,cls])
+)
+
+# Simple ROC plot
+ggroc(roc_list, legacy.axes = TRUE, size = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = paste("ROC for class", cls),
+    x     = "False Positive Rate",
+    y     = "True Positive Rate",
+    color = "Model"
+  ) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  theme_bw()
+```
+
+# Joining geoid.x back to test permanently
+
+```{r}
+test <- test %>% 
+  left_join(test_meta, by = "row_id")
+```
+
+# Combine the actual, SVM, RF, and KNN predictions
+
+```{r}
+predictions_df <- test %>% 
+  select(geoid.x, cbsa_name, actual = class1) %>% 
   mutate(
-    LogLoss    = c(LL_svm, LL_rf, LL_knn),
-    BrierScore = c(BS_svm, BS_rf, BS_knn)
+    SVM    = pred_svm_test_best,
+    RF     = pred_rf_test_best,
+    KNN    = pred_knn_test_best
   )
-
-print(metrics_df)
-```
-
-```{r}
-predictions_df <- tibble(
-  actual = test$class1,
-  SVM    = pred_svm,
-  RF     = pred_rf,
-  KNN    = pred_knn
-) %>%
-  mutate(geoid.x = newdata$geoid.x[-train_idx])
 
 head(predictions_df)
 ```
 
+# Draw the mapping for LA
+
 ```{r}
-# 1) Pull only the ID + geometry from your sf (analysis.dat):
-geom_df <- analysis.dat[-train_idx, ] %>%
-  select(geoid.x, lat, lon, cbsa_name)    # keep the real geometry list-column
+# Pull only the ID + geometry from your sf (analysis.dat):
+la_geom <- analysis.dat %>%
+  filter(cbsa_name == "Los Angeles-Long Beach, CA") %>% 
+  select(geoid.x, geometry)
 
-
-la_indicator <- geom_df$cbsa_name == "Los Angeles-Long Beach, CA"
-la_rows <- c(1:nrow(geom_df))[la_indicator]
-# final_indicator <- intersect(la_rows, setdiff(1:nrow(newdata), train_idx))
-
-# 2) Join onto your predictions and pivot long:
-pred_sf <- geom_df[la_rows,] %>%
-  select(-cbsa_name) %>%
-  right_join(predictions_df[la_rows,], by = "geoid.x") %>%
+# Join onto your predictions and pivot long:
+la_pred_sf <- la_geom %>%
+  left_join(predictions_df, by = "geoid.x") %>%
   pivot_longer(
     cols      = actual:KNN,
     names_to  = "model",
     values_to = "grade"
   )
 
-# 3) Now pred_sf is still an sf (with geometry)! Plot facet-grid:
-ggplot(pred_sf) +
+# Now pred_sf is still an sf (with geometry)! Plot facet-grid:
+ggplot(la_pred_sf) +
   geom_sf(aes(fill = grade)) +
   scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
   facet_grid(~model) +
-  labs(title = "Actual vs. Predicted HOLC Grades") +
+  labs(title = "Actual vs. Predicted HOLC Grades for Los Angeles-Long Beach, CA") +
   theme_void() +
   theme(
     strip.text      = element_text(size = 12),
@@ -381,29 +566,29 @@ ggplot(pred_sf) +
   )
 ```
 
+# Draw the mapping for Boston
 
 ```{r}
-# 1) Pull only the ID + geometry from your sf (analysis.dat):
-geom_df <- analysis.dat[-train_idx, ] %>%
-  select(geoid.x, lat, lon)    # keep the real geometry list-column
+# Pull only the ID + geometry from your sf (analysis.dat):
+bs_geom <- analysis.dat %>%
+  filter(cbsa_name == "Boston-Cambridge-Newton, MA-NH") %>% 
+  select(geoid.x, geometry)
 
-
-
-# 2) Join onto your predictions and pivot long:
-pred_sf <- geom_df %>%
-  right_join(predictions_df, by = "geoid.x") %>%
+# Join onto your predictions and pivot long:
+bs_pred_sf <- la_geom %>%
+  left_join(predictions_df, by = "geoid.x") %>%
   pivot_longer(
     cols      = actual:KNN,
     names_to  = "model",
     values_to = "grade"
   )
 
-# 3) Now pred_sf is still an sf (with geometry)! Plot facet-grid:
-ggplot(pred_sf) +
+# Now pred_sf is still an sf (with geometry)! Plot facet-grid:
+ggplot(bs_pred_sf) +
   geom_sf(aes(fill = grade)) +
   scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
   facet_grid(~model) +
-  labs(title = "Actual vs. Predicted HOLC Grades") +
+  labs(title = "Actual vs. Predicted HOLC Grades for Boston-Cambridge-Newton, MA-NH") +
   theme_void() +
   theme(
     strip.text      = element_text(size = 12),
@@ -413,38 +598,8 @@ ggplot(pred_sf) +
 ```
 
 ```{r}
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(sf)
-library(viridis)
-
-# 1) Pull only the ID + geometry from your sf (analysis.dat):
-geom_df <- analysis.dat[-train_idx, ] %>%
-  select(geoid.x, geometry)    # keep the real geometry list-column
-
-# 2) Join onto your predictions and pivot long:
-pred_sf <- geom_df %>%
-  right_join(predictions_df, by = "geoid.x") %>%
-  pivot_longer(
-    cols      = actual:KNN,
-    names_to  = "model",
-    values_to = "grade")
-  # ) %>%
-  # mutate(grade = case_when(grade == "A" ~ 1, grade == "B" ~ 2,
-  #                          grade == "C" ~ 3, grade == "D" ~ 4,))
-
-# 3) Now pred_sf is still an sf (with geometry)! Plot facet-grid:
-ggplot(pred_sf) +
-  geom_sf(aes(fill = grade)) +
-  scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
-  facet_grid(~model) +
-  labs(title = "Actual vs. Predicted HOLC Grades") +
-  theme_void() +
-  theme(
-    strip.text      = element_text(size = 12),
-    plot.title      = element_text(hjust = 0.5, size = 16),
-    legend.position = "bottom"
-  )
+imp <- importance(model.rf_test_best)
+imp[order(imp[, "MeanDecreaseGini"], decreasing = TRUE), ]
+varImpPlot(model.rf_test_best, n.var = 10, main = "Top 10 Important Variables for Random Forest")
 ```
 

@@ -413,6 +413,8 @@ test_areas <- c("Boston-Cambridge-Newton, MA-NH", "Los Angeles-Long Beach, CA")
 
 test_compute_metrics <- test
 
+plot_list <- list()
+
 res <- lapply(test_areas, function(area) {
   # Join the meta and Filter the cities and delete the columns
   test_slice <- test %>% 
@@ -539,6 +541,8 @@ res <- lapply(test_areas, function(area) {
       legend.position = "bottom"
     )
   
+  plot_list[[area]] <<- g
+  
   print(g)
   
   imp <- importance(model.rf_test_best)
@@ -551,4 +555,3 @@ res <- lapply(test_areas, function(area) {
 
 res
 ```
-

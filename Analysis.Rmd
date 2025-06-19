@@ -32,6 +32,7 @@ library(MLmetrics)
 library(ggplot2)
 library(viridis)
 library(pROC)
+library(gtsummary)
 ```
 
 ## Loading the dataset
@@ -398,11 +399,21 @@ best_ntree_rf
 best_acc_rf_val
 ```
 
-# Computing all of the metrics for the performance of the 3 models - building the function
+# Compute the metrics + ROC-AUC curve + Graphing
 
 ```{r}
-compute_metrics <- function(train, test_slice) {
-  # Retraining all 3 models
+test_areas <- c("Boston-Cambridge-Newton, MA-NH", "Los Angeles-Long Beach, CA")
+
+test_compute_metrics <- test
+
+res <- lapply(test_areas, function(area) {
+  # Join the meta and Filter the cities and delete the columns
+  test_slice <- test %>% 
+    left_join(test_meta, by = "row_id") %>%
+    filter(cbsa_name == area) %>%
+    select(-formatGeoID, -geoid.x, -cbsa_name, -cartodb_id, -objectid, -cbsa10, -lat, -lon)
+  
+  # Compute the metrics
   model.svm_test_best <- svm(class1 ~ ., data = train, cost = best_cost_svm, gamma = best_gamma_svm, probability=T)
   model.knn_test_best <- knn3(class1 ~ ., data = train, k = best_k_knn, l = best_l_knn, prob=T)
   model.rf_test_best <- randomForest(class1 ~ ., data = train, mtry=best_mtry_rf, ntree=best_ntree_rf)
@@ -441,7 +452,7 @@ compute_metrics <- function(train, test_slice) {
   BS <- c(brier(prob_svm, test_slice$class1), brier(prob_rf, test_slice$class1), brier(prob_knn, test_slice$class1))
   
   # Assemble
-  df <- data.frame(
+  res <- data.frame(
     Model       = c("SVM","RF","KNN"),
     Accuracy    = c(cm_svm$overall["Accuracy"],
                     cm_rf$overall["Accuracy"],
@@ -459,147 +470,79 @@ compute_metrics <- function(train, test_slice) {
     BrierScore  = BS
   )
   
-  # Return dataframe
-  return(df)
-}
-```
-
-# Using the function above to compute the metrics
-
-```{r}
-test_areas <- c("Boston-Cambridge-Newton, MA-NH", "Los Angeles-Long Beach, CA")
-
-test_compute_metrics <- test
-
-res <- lapply(test_areas, function(area) {
-  # Join the meta and Filter the cities and delete the columns
-  test_slice <- test %>% 
-    left_join(test_meta, by = "row_id") %>%
-    filter(cbsa_name == area) %>%
-    select(-formatGeoID, -geoid.x, -cbsa_name, -cartodb_id, -objectid, -cbsa10, -lat, -lon)
+  cls <- "A"
+  # Compute ROC objects
+  roc_list <- list(
+    SVM = roc(response = test_slice$class1 == cls, predictor = prob_svm[,cls]),
+    RF  = roc(response = test_slice$class1 == cls, predictor = prob_rf[,cls]),
+    KNN = roc(response = test_slice$class1 == cls, predictor = prob_knn[,cls])
+  )
   
-  # Compute the metrics
-  res <- compute_metrics(train, test_slice)
+  # Simple ROC plot
+  p <- ggroc(roc_list, legacy.axes = TRUE, size = 1.2) +
+    geom_abline(linetype = "dashed", color = "gray") +
+    labs(
+      title = paste("ROC for class", cls, "for", area),
+      x     = "False Positive Rate",
+      y     = "True Positive Rate",
+      color = "Model"
+    ) +
+    theme_bw()
+  
+  # Printing out the graph
+  print(p)
+  
+  # Joining geoid.x back to test permanently
+  test_slice <- test_slice %>% 
+    left_join(test_meta, by = "row_id")
+  
+  # Combine the actual, SVM, RF, and KNN predictions
+  predictions_df <- test_slice %>% 
+    select(geoid.x, actual = class1) %>% 
+    mutate(
+      SVM    = pred_svm_test_best,
+      RF     = pred_rf_test_best,
+      KNN    = pred_knn_test_best
+    )
+
+  # Pull only the ID and geometry from your newdata
+  la_geom <- analysis.dat %>%
+    filter(cbsa_name == area) %>%
+    select(geoid.x, geometry)
+  
+  # Join onto your predictions and pivot long:
+  la_pred_sf <- la_geom %>%
+    left_join(predictions_df, by = "geoid.x") %>%
+    pivot_longer(
+      cols      = actual:KNN,
+      names_to  = "model",
+      values_to = "grade"
+    )
+  
+  # Graphing
+  g <- ggplot(la_pred_sf) +
+    geom_sf(aes(fill = grade)) +
+    scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
+    facet_grid(~model) +
+    #labs(title = "Actual vs. Predicted HOLC Grades for", area) +
+    theme_void() +
+    theme(
+      strip.text      = element_text(size = 12),
+      plot.title      = element_text(hjust = 0.5, size = 16),
+      legend.position = "bottom"
+    )
+  
+  print(g)
   
   # Bind the columns
   bind_cols(test_areas = area, res)
 }) %>% bind_rows()
 
-print(res)
-```
-
-# ROC-AUC curve
-
-```{r}
-cls <- "A"
-
-# Compute ROC objects
-roc_list <- list(
-  SVM = roc(response = test$class1 == cls, predictor = prob_svm[,cls]),
-  RF  = roc(response = test$class1 == cls, predictor = prob_rf[,cls]),
-  KNN = roc(response = test$class1 == cls, predictor = prob_knn[,cls])
-)
-
-# Simple ROC plot
-ggroc(roc_list, legacy.axes = TRUE, size = 1.2) +
-  geom_abline(linetype = "dashed", color = "gray") +
-  labs(
-    title = paste("ROC for class", cls),
-    x     = "False Positive Rate",
-    y     = "True Positive Rate",
-    color = "Model"
-  ) +
-  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
-  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
-  theme_bw()
-```
-
-# Joining geoid.x back to test permanently
-
-```{r}
-test <- test %>% 
-  left_join(test_meta, by = "row_id")
-```
-
-# Combine the actual, SVM, RF, and KNN predictions
-
-```{r}
-predictions_df <- test %>% 
-  select(geoid.x, cbsa_name, actual = class1) %>% 
-  mutate(
-    SVM    = pred_svm_test_best,
-    RF     = pred_rf_test_best,
-    KNN    = pred_knn_test_best
-  )
-
-head(predictions_df)
-```
-
-# Draw the mapping for LA
-
-```{r}
-# Pull only the ID + geometry from your sf (analysis.dat):
-la_geom <- analysis.dat %>%
-  filter(cbsa_name == "Los Angeles-Long Beach, CA") %>% 
-  select(geoid.x, geometry)
-
-# Join onto your predictions and pivot long:
-la_pred_sf <- la_geom %>%
-  left_join(predictions_df, by = "geoid.x") %>%
-  pivot_longer(
-    cols      = actual:KNN,
-    names_to  = "model",
-    values_to = "grade"
-  )
-
-# Now pred_sf is still an sf (with geometry)! Plot facet-grid:
-ggplot(la_pred_sf) +
-  geom_sf(aes(fill = grade)) +
-  scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
-  facet_grid(~model) +
-  labs(title = "Actual vs. Predicted HOLC Grades for Los Angeles-Long Beach, CA") +
-  theme_void() +
-  theme(
-    strip.text      = element_text(size = 12),
-    plot.title      = element_text(hjust = 0.5, size = 16),
-    legend.position = "bottom"
-  )
-```
-
-# Draw the mapping for Boston
-
-```{r}
-# Pull only the ID + geometry from your sf (analysis.dat):
-bs_geom <- analysis.dat %>%
-  filter(cbsa_name == "Boston-Cambridge-Newton, MA-NH") %>% 
-  select(geoid.x, geometry)
-
-# Join onto your predictions and pivot long:
-bs_pred_sf <- la_geom %>%
-  left_join(predictions_df, by = "geoid.x") %>%
-  pivot_longer(
-    cols      = actual:KNN,
-    names_to  = "model",
-    values_to = "grade"
-  )
-
-# Now pred_sf is still an sf (with geometry)! Plot facet-grid:
-ggplot(bs_pred_sf) +
-  geom_sf(aes(fill = grade)) +
-  scale_fill_viridis_d(name = "HOLC Grade", na.value = "grey90") +
-  facet_grid(~model) +
-  labs(title = "Actual vs. Predicted HOLC Grades for Boston-Cambridge-Newton, MA-NH") +
-  theme_void() +
-  theme(
-    strip.text      = element_text(size = 12),
-    plot.title      = element_text(hjust = 0.5, size = 16),
-    legend.position = "bottom"
-  )
+res
 ```
 
 ```{r}
-imp <- importance(model.rf_test_best)
-imp[order(imp[, "MeanDecreaseGini"], decreasing = TRUE), ]
-varImpPlot(model.rf_test_best, n.var = 10, main = "Top 10 Important Variables for Random Forest")
+#imp <- importance(model.rf_test_best)
+#imp[order(imp[, "MeanDecreaseGini"], decreasing = TRUE), ]
+#varImpPlot(model.rf_test_best, n.var = 10, main = "Top 10 Important Variables for Random Forest")
 ```
-

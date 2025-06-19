@@ -151,6 +151,13 @@ newdata <- newdata %>%
   mutate(class1 = as.factor(class1))
 ```
 
+# Dropping misleading columns
+
+```{r}
+newdata <- newdata %>%
+  select(-scorea, -scoreb, -scorec, -scored, -scored, -scoree, -hdscore, -cbsa_quartile, -natl_quartile)
+```
+
 # Filtering out only 3 targeted cities for analysis
 
 ```{r}
@@ -191,7 +198,7 @@ test_meta  <- test  %>% select(row_id, formatGeoID, geoid.x, cbsa_name, cartodb_
 
 # Delete the columns for training purpose
 train <- train %>%
-  select(-formatGeoID, -geoid.x, -cbsa_name, -cartodb_id, -objectid, -cbsa10, -lat, -lon)
+  select(-formatGeoID, -geoid.x, -cbsa_name, -cartodb_id, -objectid, -cbsa10, -lat, -lon, -row_id)
 
 test <- test %>%
   select(-formatGeoID, -geoid.x, -cbsa_name, -cartodb_id, -objectid, -cbsa10, -lat, -lon)
@@ -534,6 +541,10 @@ res <- lapply(test_areas, function(area) {
   
   print(g)
   
+  imp <- importance(model.rf_test_best)
+  imp[order(imp[, "MeanDecreaseGini"], decreasing = TRUE)]
+  varImpPlot(model.rf_test_best, n.var = 10)
+  
   # Bind the columns
   bind_cols(test_areas = area, res)
 }) %>% bind_rows()
@@ -541,8 +552,3 @@ res <- lapply(test_areas, function(area) {
 res
 ```
 
-```{r}
-#imp <- importance(model.rf_test_best)
-#imp[order(imp[, "MeanDecreaseGini"], decreasing = TRUE), ]
-#varImpPlot(model.rf_test_best, n.var = 10, main = "Top 10 Important Variables for Random Forest")
-```
